@@ -5,6 +5,7 @@
 # TODO: FIlter protocols, Consider UDP, ICMP, ignore background packets involving TCP, DNS, STP
 # TODO: Filter UDP Noise: Trace files may contain irrelevant UDP traffic like NBNS. Filter out by ensuring dest. ports all within trace route range
 #       (dst_port >= 33434) && (dst_port <= 33529)
+import math
 import io, os, struct, sys
 import packet_struct
 
@@ -105,7 +106,7 @@ def check_ip_and_process(data, count, ts_sec_bytes, ts_usec_bytes, orig_time):
     # Extract IP addresses for destination and source
     packet.IP_header.get_IP(data[26:30], data[30:34])
 
-    packet.IP_header.get_protocol(data[25:26])
+    packet.IP_header.get_protocol(data[23:24])
     packet.IP_header.get_fragmentation_info(data[18:20], data[20:22])
 
     protocol = packet.IP_header.protocol
@@ -153,125 +154,74 @@ def check_ip_and_process(data, count, ts_sec_bytes, ts_usec_bytes, orig_time):
 
     return packet
 
-def group_into_connections(packet_list: list) -> dict:
-    connection_dict = {}
-    for packet in packet_list:
-        if packet.IP_header.src_ip < packet.IP_header.dst_ip:
-            key = (
-                packet.IP_header.src_ip,
-                packet.TCP_header.src_port,
-                packet.IP_header.dst_ip,
-                packet.TCP_header.dst_port
-                )
-        else:
-            key = (
-                packet.IP_header.dst_ip,
-                packet.TCP_header.dst_port, 
-                packet.IP_header.src_ip, 
-                packet.TCP_header.src_port
-                )
+def analyze_traceroute(parsed_packets: list):
+    source_node = None;
+    ultimate_dest = None;   
+    intermediates = []
+    protocols = set()
 
-        if key not in connection_dict:
-            connection_dict[key] = Connection(key)
-        connection_dict[key].add_packet(packet)
-    return connection_dict
+    frag_count = 0
+    last_frag_offset = 0
 
-def analyze_connections(connections: dict):
+    probes_sent = {}
+    rtt_measurements = {}
+    ult_rtts = {}
 
-    complete_connections = []
+    for p in parsed_packets:
+        protocols.add(p.IP_header.protocol)
+        if source_node is None:
+            source_node = p.IP_header.src_ip
 
-    # Analyze state of every connection and create list of completed ones.
-    for conn in connections.values():
-        conn.analyze_state()
+        if p.is_probe and p.IP_header.src_ip == source_node:
+            ultimate_dest = p.IP_header.dst_ip
 
-        if conn.is_complete:
-            complete_connections.append(conn)
 
-    return complete_connections
+            offset = p.IP_header.frag_offset
+            if p.IP_header.flags == 1 or offset > 0:
+                if offset > last_frag_offset: last_frag_offset = offset
+                if offset == 0: frag_count = 0
+                frag_count += 1
+            elif frag_count == 0:
+                frag_count = 1 
+            match_key = p.UDP_header.src_port if p.IP_header.protocol == 17 else p.ICMP_header.seq_num
+            if match_key not in probes_sent: probes_sent[match_key] = []
+            probes_sent[match_key].append(p.timestamp)
+        elif p.is_error and p.IP_header.dst_ip == source_node:
+            router_ip = p.IP_header.src_ip
+            if router_ip != ultimate_dest and router_ip not in intermediates:
+                intermediates.append(router_ip)
+                rtt_measurements[router_ip] = []
 
-def print_report(connections: dict, complete_connections: list):
-    print(f"A) Total number of connections: {len(connections)}")
-    print()
-    print("-" * 40)
-    print()
-    print("B) Connections' Details")
-    print()
-    reset_connections = 0
-    before_capture = 0
-    open_connections = 0
-    count = 0
-    for conn in connections.values():
-        if count != 0:
-            print("+" * 40)
-        conn: Connection
-        if conn.is_open():
-            open_connections += 1
-        if conn.rst_count >= 1:
-            reset_connections += 1
-        if conn.packets[0].TCP_header.flags.get("SYN") != 1:
-            before_capture += 1
-        count += 1
-        
-        print(f"Connection {count}:")
-        print(f"Source Address: {conn.packets[0].IP_header.src_ip}")
-        print(f"Destination Address: {conn.packets[0].IP_header.dst_ip}")
-        print(f"Source Port: {conn.packets[0].TCP_header.src_port}")
-        print(f"Destination Port: {conn.packets[0].TCP_header.dst_port}")
-        print(f"Status: {conn.state}")
-        if conn.is_complete:
-            print(f"Start Time: {conn.start_time:.6f}s")
-            print(f"End Time: {conn.end_time:.6f}s")
-            print(f"Duration: {(conn.end_time - conn.start_time):.6f}s")
-            print(f"Number of packets sent from Source to Destination: {conn.src_to_dst_packets}")
-            print(f"Number of packets sent from Destination to Source: {conn.dst_to_src_packets}")
-            print(f"Total Number of packets: {conn.src_to_dst_packets + conn.dst_to_src_packets}")
-            print(f"Number of data bytes sent from Source to Destination: {conn.src_to_dst_bytes}B")
-            print(f"Number of data bytes sent from Destination to Source: {conn.dst_to_src_bytes}B")
-            print(f"Total Number of Data Bytes: {conn.dst_to_src_bytes + conn.src_to_dst_bytes}B")
-        print("END")
-    print()
-    print("-" * 40)
-    print()
-    print("C) General")
-    print()
-    print(f"Total Number of Complete TCP Connections: {len(complete_connections)}")
-    print(f"Total Number of Reset TCP Connections: {reset_connections}")
-    print(f"Number of TCP Connections still open when the trace capture ended: {open_connections}")
-    print(f"Number of TCP Connections established before the capture started: {before_capture}")
-    print("-" * 40)
-    complete_connection_statistics(complete_connections)
+            if p.embedded_match_key and p.embedded_match_key in probes_sent:
+                for sent_time in probes_sent[p.embedded_match_key]:
+                    rtt = round((p.timestamp - sent_time) * 1000, 6)
 
-def complete_connection_statistics(complete_connections: list):
-    durations = [c.end_time - c.start_time for c in complete_connections]
-    rtts = [r for c in complete_connections for r in c.rtts]
-    packets = [len(c.packets) for c in complete_connections]
-    windows = [w for c in complete_connections for w in c.window_sizes]
-    if not complete_connections:
-        print("There were no complete TCP connections...")
-        return
-    print()
-    print("D) Complete TCP Connections:")
-    print()
-    print(f"Minimum Time Duration: {min(durations):.6f}s")
-    print(f"Mean Time Duration: {sum(durations) / len(durations):.6f}s")
-    print(f"Maximum Time Duration: {max(durations):.6f}s")
-    print()
-    if rtts:
-        print(f"Minimum RTT Value: {min(rtts):.6f}s")
-        print(f"Mean RTT Value: {sum(rtts) / len(rtts):.6f}s")
-        print(f"Maximum RTT Value: {max(rtts):.6f}s")
-    else:
-        print("Minimum RTT Value: N/A")
-        print("Mean RTT Value: N/A")
-        print("Maximum RTT Value: N/A")
-    print()
-    print(f"Minimum Number of Packets including both send/received: {min(packets)}")
-    print(f"Mean Number of Packets including both send/received: {sum(packets) / len(packets):.6f}")
-    print(f"Maximum Number of Packets including both send/received: {max(packets)}")
-    print()
-    print(f"Minimum Receive Window Size including both send/received: {min(windows)}B")
-    print(f"Mean Receive Window Size including both send/received: {sum(windows) / len(windows):.6f}B")
-    print(f"Maximum Receive Window Size including both send/received: {max(windows)}B")
+                    if router_ip == ultimate_dest:
+                        ult_rtts.append(rtt)
+                    else:
+                        rtt_measurements[router_ip].append(rtt)
+                del probes_sent[p.embedded_match_key]
+    if frag_count == 1 and last_frag_offset == 0:
+        pass
+
+    return source_node, ultimate_dest, intermediates, protocols, frag_count, last_frag_offset, rtt_measurements, ult_rtts
+
+
+def calculate_stats(rtt_list):
+    if not rtt_list: return 0.0, 0.0
+    mean = sum(rtt_list) / len(rtt_list)
+    variance = sum((x - mean) ** 2 for x in rtt_list) / (len(rtt_list) - 1) if len(rtt_list) > 1 else 0.0
+    return round(mean, 2), round(math.sqrt(variance), 2)
+
+def generate_results(src, dst, routers, protos, fc, f_off, rtts, ult_rtts):
+    print(f"The IP address of the source node: {src}")
+    print(f"The IP address of the destination node: {dst}")
+    if len(routers) > 0:
+        print("The IP addresses of the intermediate destination nodes:")
+        i = 1
+        for r in routers:
+            print(f"\trouter {i}: {routers[i - 1]}")
+            i += 1
 
 if __name__ == "__main__":
 
@@ -285,7 +235,9 @@ if __name__ == "__main__":
     endian, f, is_nano = parse_global_header(filename)
     if f is None:
         sys.exit(1)
+
+
     packets = parse_packets(endian, f, is_nano)
-    print(packets)
-
-
+    src, dst, routers, protocols, frag_count, frag_offset, rtts, ult_rtts = analyze_traceroute(packets)
+    generate_results(src, dst, routers, protocols, frag_count, frag_offset, rtts, ult_rtts)
+    print()

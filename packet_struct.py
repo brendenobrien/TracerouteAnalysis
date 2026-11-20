@@ -49,7 +49,7 @@ class IP_Header:
         self.identification = struct.unpack('>H', id_buffer)[0]
         frag_info = struct.unpack('>H', frag_buffer)[0]
         self.flags = frag_info >> 13
-        self.flag_offset = (frag_info & 0x1FFF) * 8
+        self.frag_offset = (frag_info & 0x1FFF) * 8
  
 class UDP_Header:
     def __init__(self):
