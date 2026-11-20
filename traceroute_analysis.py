@@ -61,25 +61,26 @@ def parse_packets(endian: str, f: io.BufferedReader) -> list:
         packet_data = f.read(incl_len)
 
         # Process packet data
-        tcp_packet = check_tcp_and_process(
+        ip_packet = check_ip_and_process(
             packet_data,
             packet_count,
             time_absolute,
             orig_time
         )
 
-        if tcp_packet is not None:
-            packets.append(tcp_packet)
+        if ip_packet is not None:
+            packets.append(ip_packet)
     f.close()
     return packets
 
-def check_tcp_and_process(data, count, time_absolute, orig_time):
+def check_ip_and_process(data, count, time_absolute, orig_time):
     if len(data) < 34:
         return None
     
     protocol_val = struct.unpack('B', data[23:24])[0]
 
-    if protocol_val != 6:
+    # Filters out protocols that are not ICMP or UDP
+    if protocol_val not in [1, 17]:
         return None
     
     # Create packet object
@@ -98,26 +99,9 @@ def check_tcp_and_process(data, count, time_absolute, orig_time):
     tcp = ip + packet.IP_header.ip_header_len
     if len(data) < tcp + 20:
         return None
-    # Extract TCP Source Port
-    packet.TCP_header.get_src_port(data[tcp: tcp + 2])
-
-    # Extract Destination Port
-    packet.TCP_header.get_dst_port(data[tcp + 2: tcp + 4])
-
-    # Extract SEQ Num
-    packet.TCP_header.get_seq_num(data[tcp + 4: tcp + 8])
-
-    # Extract ACK Num
-    packet.TCP_header.get_ack_num(data[tcp + 8: tcp + 12])
-
-    # Extract Data Offset
-    packet.TCP_header.get_data_offset(data[tcp + 12: tcp + 13])
-
-    # Extract Flags
-    packet.TCP_header.get_flags(data[tcp + 13: tcp + 14])
-
-    # Extract Window Size
-    packet.TCP_header.get_window_size(data[tcp + 14: tcp + 15], data[tcp + 15: tcp + 16])
+    
+    protocol = packet.IP_header.get_protocol(data[25:26])
+    print(protocol)
     return packet
 
 def group_into_connections(packet_list: list) -> dict:
@@ -242,14 +226,18 @@ def complete_connection_statistics(complete_connections: list):
 
 if __name__ == "__main__":
 
-    if len(sys.argv) > 1:
+    if len(sys.argv) == 2:
         filename = sys.argv[1] # If file provided in command line, use this one
+    elif len(sys.argv) > 2: 
+        print("Too many arguments:\nUsage: traceroute_analysis.py <path-to-capfile>")
+        filename = None
     else:
         filename = None
     print(filename)
- 
-#    endian, f = parse_global_header(filename)
- #   packets = parse_packets(endian, f)
+    endian, f = parse_global_header(filename)
+    print(endian)
+    packets = parse_packets(endian, f)
+    check_ip_and_process(packets)
 
     
 

@@ -41,138 +41,49 @@ class IP_Header:
         num4 = (buffer[1]&15)
         length = num1+num2+num3+num4
         self.total_len_set(length)
+
+    def get_protocol(self, buffer):
+        self.protocol = struct.unpack('B', buffer)[0]
+
+    def get_fragmentation_info(self, id_buffer, frag_buffer):
+        self.identification = struct.unpack('>H', id_buffer)[0]
+        frag_info = struct.unpack('>H', frag_buffer)[0]
+        self.flags = frag_info >> 13
+        self.flag_offset = (frag_info & 0x1FFF) * 8
  
-class TCP_Header:
-    src_port = 0
-    dst_port = 0
-    seq_num = 0
-    ack_num = 0
-    data_offset = 0
-    flags = {}
-    window_size =0
-    checksum = 0
-    ugp = 0
-    
+class UDP_Header:
     def __init__(self):
         self.src_port = 0
         self.dst_port = 0
-        self.seq_num = 0
-        self.ack_num = 0
-        self.data_offset = 0
-        self.flags = {}
-        self.window_size =0
-        self.checksum = 0
-        self.ugp = 0
-    
-    def src_port_set(self, src):
-        self.src_port = src
-        
-    def dst_port_set(self,dst):
-        self.dst_port = dst
-        
-    def seq_num_set(self,seq):
-        self.seq_num = seq
-        
-    def ack_num_set(self,ack):
-        self.ack_num = ack
-        
-    def data_offset_set(self,data_offset):
-        self.data_offset = data_offset
-        
-    def flags_set(self,ack, rst, syn, fin):
-        self.flags["ACK"] = ack
-        self.flags["RST"] = rst
-        self.flags["SYN"] = syn
-        self.flags["FIN"] = fin
-    
-    def win_size_set(self,size):
-        self.window_size = size
-        
-    def get_src_port(self,buffer):
-        num1 = ((buffer[0]&240)>>4)*16*16*16
-        num2 = (buffer[0]&15)*16*16
-        num3 = ((buffer[1]&240)>>4)*16
-        num4 = (buffer[1]&15)
-        port = num1+num2+num3+num4
-        self.src_port_set(port)
-        #print(self.src_port)
-        return None
-    
-    def get_dst_port(self,buffer):
-        num1 = ((buffer[0]&240)>>4)*16*16*16
-        num2 = (buffer[0]&15)*16*16
-        num3 = ((buffer[1]&240)>>4)*16
-        num4 = (buffer[1]&15)
-        port = num1+num2+num3+num4
-        self.dst_port_set(port)
-        #print(self.dst_port)
-        return None
-    
-    def get_seq_num(self,buffer):
-        seq = struct.unpack(">I",buffer)[0]
-        self.seq_num_set(seq)
-        #print(seq)
-        return None
-    
-    def get_ack_num(self,buffer):
-        ack = struct.unpack('>I',buffer)[0]
-        self.ack_num_set(ack)
-        return None
-    
-    def get_flags(self,buffer):
-        value = struct.unpack("B",buffer)[0]
-        fin = value & 1
-        syn = (value & 2)>>1
-        rst = (value & 4)>>2
-        ack = (value & 16)>>4
-        self.flags_set(ack, rst, syn, fin)
-        return None
-    def get_window_size(self,buffer1,buffer2):
-        buffer = buffer2+buffer1
-        size = struct.unpack('H',buffer)[0]
-        self.win_size_set(size)
-        return None
-        
-    def get_data_offset(self,buffer):
-        value = struct.unpack("B",buffer)[0]
-        length = ((value & 240)>>4)*4
-        self.data_offset_set(length)
-        #print(self.data_offset)
-        return None
-    
-    def relative_seq_num(self,orig_num):
-        if(self.seq_num>=orig_num):
-            relative_seq = self.seq_num - orig_num
-            self.seq_num_set(relative_seq)
-        #print(self.seq_num)
-        
-    def relative_ack_num(self,orig_num):
-        if(self.ack_num>=orig_num):
-            relative_ack = self.ack_num-orig_num+1
-            self.ack_num_set(relative_ack)
-   
 
-class packet():
-    
-    #pcap_hd_info = None
-    IP_header = None
-    TCP_header = None
-    timestamp = 0
-    packet_No = 0
-    RTT_value = 0
-    RTT_flag = False
-    buffer = None
-    
-    
+    def get_ports(self, buffer):
+        self.src_port = struct.unpack('>H', buffer[0:2])[0]
+        self.dst_port = struct.unpack('>H', buffer[2:4])[0]
+
+class ICMP_Header:
+    def __init__(self):
+        self.type = 0
+        self.code = 0
+        self.seq_num = 0
+
+    def get_type_and_code(self, buffer):
+        self.type, self.code = struct.unpack('BB', buffer[0:2])
+
+    def get_sequence_num(self, buffer):
+        self.seq_num = struct.unpack('>H', buffer[0:2])[0]
+
+class packet:
+
     def __init__(self):
         self.IP_header = IP_Header()
-        self.TCP_header = TCP_Header()
-        #self.pcap_hd_info = pcap_ph_info()
+        self.UDP_header = None
+        self.ICMP_header = None
         self.timestamp = 0
-        self.packet_No =0
-        self.RTT_value = 0.0
-        self.RTT_flag = False
-        self.buffer = None
+        self.packet_No = 0
+
+        self.is_probe = False
+        self.is_error = False
+        self.embedded_match_key = None
         
     def timestamp_set(self,buffer1,buffer2,orig_time):
         seconds = struct.unpack('I',buffer1)[0]
@@ -182,7 +93,3 @@ class packet():
     def packet_No_set(self,number):
         self.packet_No = number
         #print(self.packet_No)
-        
-    def get_RTT_value(self,p):
-        rtt = p.timestamp-self.timestamp
-        self.RTT_value = round(rtt,8)
