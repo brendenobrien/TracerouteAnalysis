@@ -22,7 +22,7 @@ def parse_global_header(filename: str):
     if len(global_header) < 24:
         print("File too small to contain global header")
         sys.exit(1)
-
+    is_nano = False
     # Grab magic number
     magic = struct.unpack("<I", global_header[:4])[0]
     if magic == 0xd4c3b2a1:
@@ -31,16 +31,23 @@ def parse_global_header(filename: str):
     elif magic == 0xa1b2c3d4:
         #print("Native endian formatting")
         endian = "<"
+    elif magic == 0xa1b23c4d:
+        endian = "<"
+        is_nano = True
+    elif magic == 0x4d3cb2a1:
+        endian = ">"
+        is_nano = True
     else:
         print(f"Unknown magic number {hex(magic)}")
         sys.exit(1)
-    return endian, f
+    return endian, f, is_nano
 
-def parse_packets(endian: str, f: io.BufferedReader) -> list:
+def parse_packets(endian: str, f: io.BufferedReader, is_nano: bool) -> list:
     packet_count = 0
     orig_time = None
     packets = []
     head_format = endian + "IIII"
+    ts_mult = 0.000000001 if is_nano else 0.000001
 
     while(True):
         # Read packet header
@@ -53,7 +60,9 @@ def parse_packets(endian: str, f: io.BufferedReader) -> list:
 
         # Extract header data
         ts_sec, ts_usec, incl_len, orig_len = struct.unpack(head_format, packet_header)
-        time_absolute = ts_sec + (ts_usec * 0.000001)
+        
+        time_absolute = ts_sec + (ts_usec * ts_mult)
+
 
         if orig_time == None:
             orig_time = time_absolute
@@ -64,7 +73,8 @@ def parse_packets(endian: str, f: io.BufferedReader) -> list:
         ip_packet = check_ip_and_process(
             packet_data,
             packet_count,
-            time_absolute,
+            packet_header[0:4],
+            packet_header[4:8],
             orig_time
         )
 
@@ -73,35 +83,74 @@ def parse_packets(endian: str, f: io.BufferedReader) -> list:
     f.close()
     return packets
 
-def check_ip_and_process(data, count, time_absolute, orig_time):
+def check_ip_and_process(data, count, ts_sec_bytes, ts_usec_bytes, orig_time):
     if len(data) < 34:
         return None
-    
-    protocol_val = struct.unpack('B', data[23:24])[0]
 
-    # Filters out protocols that are not ICMP or UDP
-    if protocol_val not in [1, 17]:
+    eth_type = struct.unpack('>H', data[12:14])[0]
+    if eth_type != 0x0800:
         return None
     
     # Create packet object
     packet = packet_struct.packet()
     packet.packet_No_set(count)
-    packet.timestamp = round(time_absolute - orig_time, 6)
+    packet.timestamp_set(ts_sec_bytes, ts_usec_bytes, orig_time)
 
     ip = 14
-
     packet.IP_header.get_header_len(data[ip: ip + 1]) 
+    ip_len = packet.IP_header.ip_header_len
+    
     packet.IP_header.get_total_len(data[ip + 2:ip + 4])
 
     # Extract IP addresses for destination and source
     packet.IP_header.get_IP(data[26:30], data[30:34])
 
-    tcp = ip + packet.IP_header.ip_header_len
-    if len(data) < tcp + 20:
+    packet.IP_header.get_protocol(data[25:26])
+    packet.IP_header.get_fragmentation_info(data[18:20], data[20:22])
+
+    protocol = packet.IP_header.protocol
+    if protocol not in [1, 17]:
         return None
-    
-    protocol = packet.IP_header.get_protocol(data[25:26])
-    print(protocol)
+
+    payload_ind = ip + ip_len
+
+    if protocol == 17 and len(data) >= payload_ind + 4:
+        packet.UDP_header = packet_struct.UDP_Header()
+        packet.UDP_header.get_ports(data[payload_ind:payload_ind+4])
+
+        if 33434 <= packet.UDP_header.dst_port <= 33529:
+            packet.is_probe = True
+
+
+    elif protocol == 1 and len(data) >= payload_ind+8:
+        packet.ICMP_header = packet_struct.ICMP_Header()
+        packet.ICMP_header.get_type_and_code(data[payload_ind:payload_ind+2])
+
+        icmp_type = packet.ICMP_header.type
+        if icmp_type == 8:
+            packet.ICMP_header.get_sequence_num(data[payload_ind+6:payload_ind+8])
+            packet.is_probe = True
+        elif icmp_type in [11, 0]:
+            packet.is_error = True
+            orig_ip_start = payload_ind+8
+
+            if len(data) >= orig_ip_start + 20:
+                orig_ihl = (data[orig_ip_start] & 0x0F) * 4
+                orig_protocol = data[orig_ip_start+9]
+                orig_payload_ind = orig_ip_start + orig_ihl
+
+
+                if orig_protocol == 17 and len(data) >= orig_payload_ind + 2:
+                    packet.embedded_match_key = \
+                    struct.unpack('>H', data[orig_payload_ind: orig_payload_ind+2])[0]
+                elif orig_protocol == 1 and len(data) >= orig_payload_ind + 8:
+                    packet.embedded_match_key = \
+                    struct.unpack('>H', data[orig_payload_ind+6:orig_payload_ind+8])[0]
+
+            if icmp_type == 0 and not packet.embedded_match_key:
+                packet.embedded_match_key = \
+                struct.unpack('>H', data[payload_ind + 6: payload_ind+8])[0]
+
     return packet
 
 def group_into_connections(packet_list: list) -> dict:
@@ -233,12 +282,10 @@ if __name__ == "__main__":
         filename = None
     else:
         filename = None
-    print(filename)
-    endian, f = parse_global_header(filename)
-    print(endian)
-    packets = parse_packets(endian, f)
-    check_ip_and_process(packets)
-
-    
+    endian, f, is_nano = parse_global_header(filename)
+    if f is None:
+        sys.exit(1)
+    packets = parse_packets(endian, f, is_nano)
+    print(packets)
 
 
