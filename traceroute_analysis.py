@@ -106,6 +106,11 @@ def check_ip_and_process(data, count, ts_sec_bytes, ts_usec_bytes, orig_time):
     if protocol not in [1, 17]:
         return None
 
+    # Only the first fragment (offset 0) carries the UDP/ICMP header.
+    # Later fragments are raw payload, so don't try to parse ports from them.
+    if packet.IP_header.frag_offset > 0:
+        return packet
+
     payload_ind = ip + ip_len
 
     if protocol == 17 and len(data) >= payload_ind + 4:
@@ -128,74 +133,84 @@ def check_ip_and_process(data, count, ts_sec_bytes, ts_usec_bytes, orig_time):
             packet.is_error = True
             orig_ip_start = payload_ind+8
 
-            if len(data) >= orig_ip_start + 20:
+            if icmp_type == 0:
+                # Echo reply: sequence number is in this packet's own ICMP header
+                packet.embedded_match_key = \
+                struct.unpack('>H', data[payload_ind+6:payload_ind+8])[0]
+            elif len(data) >= orig_ip_start + 20:
+                # Type 11 / 3: original IP header is embedded after the 8-byte ICMP header
                 orig_ihl = (data[orig_ip_start] & 0x0F) * 4
                 orig_protocol = data[orig_ip_start+9]
                 orig_payload_ind = orig_ip_start + orig_ihl
 
-
                 if orig_protocol == 17 and len(data) >= orig_payload_ind + 2:
+                    # Linux: original UDP source port
                     packet.embedded_match_key = \
                     struct.unpack('>H', data[orig_payload_ind: orig_payload_ind+2])[0]
                 elif orig_protocol == 1 and len(data) >= orig_payload_ind + 8:
+                    # Windows: original ICMP echo sequence number
                     packet.embedded_match_key = \
                     struct.unpack('>H', data[orig_payload_ind+6:orig_payload_ind+8])[0]
-
-            if icmp_type == 0 and not packet.embedded_match_key:
-                packet.embedded_match_key = \
-                struct.unpack('>H', data[payload_ind + 6: payload_ind+8])[0]
 
     return packet
 
 def analyze_traceroute(parsed_packets: list):
-    source_node = None;
-    ultimate_dest = None;   
+    source_node = None
+    ultimate_dest = None
     intermediates = []
     protocols = set()
 
-    frag_count = 0
-    last_frag_offset = 0
-
-    probes_sent = {}
+    probes_sent = {}    # match key (UDP src port / ICMP seq) -> [IP ids]
+    send_times = {}     # IP id -> [send time of every fragment of that datagram]
+    frag_counts = {}    # IP id -> number of fragments (fragmented datagrams only)
+    frag_offsets = {}   # IP id -> largest fragment offset seen
     rtt_measurements = {}
     ult_rtts = []
 
     for p in parsed_packets:
-        protocols.add(p.IP_header.protocol)
+        ip = p.IP_header
+        protocols.add(ip.protocol)
         if source_node is None:
-            source_node = p.IP_header.src_ip
+            source_node = ip.src_ip
 
-        if p.is_probe and p.IP_header.src_ip == source_node:
-            ultimate_dest = p.IP_header.dst_ip
+        if ip.src_ip == source_node and (p.is_probe or ip.frag_offset > 0):
+            # Every piece of an outgoing probe: the first fragment (is_probe)
+            # or a later fragment (offset > 0). All share one IP identification.
+            send_times.setdefault(ip.identification, []).append(p.timestamp)
 
+            more_fragments = ip.flags & 1
+            if more_fragments or ip.frag_offset > 0:
+                frag_counts[ip.identification] = frag_counts.get(ip.identification, 0) + 1
+                frag_offsets[ip.identification] = max(frag_offsets.get(ip.identification, 0), ip.frag_offset)
 
-            offset = p.IP_header.frag_offset
-            if p.IP_header.flags == 1 or offset > 0:
-                if offset > last_frag_offset: last_frag_offset = offset
-                if offset == 0: frag_count = 0
-                frag_count += 1
-            elif frag_count == 0:
-                frag_count = 1 
-            match_key = p.UDP_header.src_port if p.IP_header.protocol == 17 else p.ICMP_header.seq_num
-            if match_key not in probes_sent: probes_sent[match_key] = []
-            probes_sent[match_key].append(p.timestamp)
-        elif p.is_error and p.IP_header.dst_ip == source_node:
-            router_ip = p.IP_header.src_ip
+            if p.is_probe:
+                ultimate_dest = ip.dst_ip
+                match_key = p.UDP_header.src_port if ip.protocol == 17 else p.ICMP_header.seq_num
+                probes_sent.setdefault(match_key, []).append(ip.identification)
+        elif p.is_error and ip.dst_ip == source_node:
+            router_ip = ip.src_ip
             if router_ip != ultimate_dest and router_ip not in intermediates:
                 intermediates.append(router_ip)
                 rtt_measurements[router_ip] = []
 
-            if p.embedded_match_key and p.embedded_match_key in probes_sent:
-                for sent_time in probes_sent[p.embedded_match_key]:
-                    rtt = round((p.timestamp - sent_time) * 1000, 6)
+            if p.embedded_match_key is not None and p.embedded_match_key in probes_sent:
+                for ip_id in probes_sent[p.embedded_match_key]:
+                    # One RTT per fragment: reply time - that fragment's send time
+                    for sent_time in send_times[ip_id]:
+                        rtt = round((p.timestamp - sent_time) * 1000, 6)
 
-                    if router_ip == ultimate_dest:
-                        ult_rtts.append(rtt)
-                    else:
-                        rtt_measurements[router_ip].append(rtt)
+                        if router_ip == ultimate_dest:
+                            ult_rtts.append(rtt)
+                        else:
+                            rtt_measurements[router_ip].append(rtt)
                 del probes_sent[p.embedded_match_key]
-    if frag_count == 1 and last_frag_offset == 0:
-        pass
+
+    if frag_counts:
+        frag_count = max(frag_counts.values())
+        last_frag_offset = max(frag_offsets.values())
+    else:
+        frag_count = 1
+        last_frag_offset = 0
 
     return source_node, ultimate_dest, intermediates, protocols, frag_count, last_frag_offset, rtt_measurements, ult_rtts
 
