@@ -1,10 +1,3 @@
-# TODO: Extract IP Addresses of source node, ultimate destination node, 
-# and intermediate destination nodes.
-# TODO: If multiple intermediate nodes exist, order them by hop count to source node in increasing order
-# TODO: If multiple UDP msgs with same TTL hit different routers bc of load balancing,list all responding routers in exact order they appear in trace file
-# TODO: FIlter protocols, Consider UDP, ICMP, ignore background packets involving TCP, DNS, STP
-# TODO: Filter UDP Noise: Trace files may contain irrelevant UDP traffic like NBNS. Filter out by ensuring dest. ports all within trace route range
-#       (dst_port >= 33434) && (dst_port <= 33529)
 import math
 import io, os, struct, sys
 import packet_struct
@@ -60,12 +53,11 @@ def parse_packets(endian: str, f: io.BufferedReader, is_nano: bool) -> list:
             break
 
         # Extract header data
-        ts_sec, ts_usec, incl_len, orig_len = struct.unpack(head_format, packet_header)
+        ts_sec, ts_frac, incl_len, orig_len = struct.unpack(head_format, packet_header)
         
-        time_absolute = ts_sec + (ts_usec * ts_mult)
+        time_absolute = ts_sec + (ts_frac * ts_mult)
 
-
-        if orig_time == None:
+        if orig_time is None:
             orig_time = time_absolute
         # Read packet data
         packet_data = f.read(incl_len)
@@ -80,6 +72,7 @@ def parse_packets(endian: str, f: io.BufferedReader, is_nano: bool) -> list:
         )
 
         if ip_packet is not None:
+            ip_packet.timestamp = time_absolute
             packets.append(ip_packet)
     f.close()
     return packets
@@ -131,7 +124,7 @@ def check_ip_and_process(data, count, ts_sec_bytes, ts_usec_bytes, orig_time):
         if icmp_type == 8:
             packet.ICMP_header.get_sequence_num(data[payload_ind+6:payload_ind+8])
             packet.is_probe = True
-        elif icmp_type in [11, 0]:
+        elif icmp_type in [11, 0, 3]:
             packet.is_error = True
             orig_ip_start = payload_ind+8
 
@@ -165,7 +158,7 @@ def analyze_traceroute(parsed_packets: list):
 
     probes_sent = {}
     rtt_measurements = {}
-    ult_rtts = {}
+    ult_rtts = []
 
     for p in parsed_packets:
         protocols.add(p.IP_header.protocol)
@@ -216,12 +209,34 @@ def calculate_stats(rtt_list):
 def generate_results(src, dst, routers, protos, fc, f_off, rtts, ult_rtts):
     print(f"The IP address of the source node: {src}")
     print(f"The IP address of the destination node: {dst}")
+    
     if len(routers) > 0:
         print("The IP addresses of the intermediate destination nodes:")
         i = 1
+
         for r in routers:
             print(f"\trouter {i}: {routers[i - 1]}")
             i += 1
+
+    print("\n\nThe values in the protocol field of the IP headers:")
+    for p in sorted(list(protos)):
+        name = "ICMP" if p == 1 else "UDP"
+        print(f"\t{p}: {name}")
+
+    print(f"\nThe number of fragments created from the original datagram is: {fc}")
+    print(f"The offset of the last fragment is: {f_off} bytes\n")
+
+    for router in routers:
+        mean_rrt, sd_rtt = calculate_stats(rtts[router])
+        mean_str = f"{mean_rrt:g}"
+        sd_str = f"{sd_rtt:g}"
+        print(f"The avg RTT between {src} and {router} is: {mean_str} ms, the s.d. is: {sd_str} ms")
+
+    if ult_rtts:
+        mean_ult, sd_ult = calculate_stats(ult_rtts)
+        mean_str = f"{mean_ult:g}"
+        sd_str = f"{sd_ult:g}"
+        print(f"The avg RTT between {src} and {dst} is: {mean_str} ms, the s.d. is: {sd_str} ms")
 
 if __name__ == "__main__":
 
@@ -236,8 +251,6 @@ if __name__ == "__main__":
     if f is None:
         sys.exit(1)
 
-
     packets = parse_packets(endian, f, is_nano)
     src, dst, routers, protocols, frag_count, frag_offset, rtts, ult_rtts = analyze_traceroute(packets)
     generate_results(src, dst, routers, protocols, frag_count, frag_offset, rtts, ult_rtts)
-    print()
