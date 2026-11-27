@@ -140,7 +140,7 @@ def print_tabular_format(group, file_list, results):
                 count = res[0].get(ttl, 0)
                 row_str += f"{count:<{col_w}}"
             else:
-                row_str += f"{"N/A":<{col_w}}"
+                row_str += f"{'N/A':<{col_w}}"
         print(row_str)
 
     print("\n")
@@ -159,7 +159,7 @@ def print_tabular_format(group, file_list, results):
                 ip = res[1][hop_idx]
                 row_str += f'{ip:<{col_w}}'
             else:
-                row_str += f'{' ':<{col_w}}'
+                row_str += f"{' ':<{col_w}}"
         print(row_str)
 
     print('\n')
